@@ -183,12 +183,16 @@ def iter_messages(
     return worksheet.title, len(headers), generate()
 
 
-def workbook_last_row(excel_path: Path, sheet_name: str | None) -> int:
-    """Return the current physical extent; follow mode supports append-only sheets."""
+def workbook_last_nonempty_row(excel_path: Path, sheet_name: str | None) -> int:
+    """Return the last row containing data, ignoring formatted but empty rows."""
     workbook = load_workbook(excel_path, read_only=True, data_only=True)
     try:
         worksheet = workbook[sheet_name] if sheet_name else workbook.active
-        return max(1, worksheet.max_row or 1)
+        last_row = 1
+        for row_number, values in enumerate(worksheet.iter_rows(values_only=True), start=1):
+            if any(value is not None for value in values):
+                last_row = row_number
+        return last_row
     finally:
         workbook.close()
 
@@ -395,16 +399,25 @@ def main() -> int:
         publish_pass(args, oci, client, key_columns, args.start_row)
         return 0
 
-    # Follow mode is append-only: it checkpoints a physical Excel row after each
-    # successful PUT batch, then reopens the workbook on the next poll.
+    # Follow mode checkpoints the last non-empty data row, ignoring Excel's
+    # trailing rows that only contain formatting.
     excel_path = args.excel.resolve()
     state_path = args.state_file.resolve()
     initial_sheet = workbook_sheet_name(excel_path, args.sheet)
     identity = state_identity(excel_path, initial_sheet, key_columns)
     next_row = None if args.reset_state else load_next_row(state_path, identity)
+    last_data_row = workbook_last_nonempty_row(excel_path, args.sheet)
     if next_row is None:
-        next_row = workbook_last_row(excel_path, args.sheet) + 1 if args.start_at_end else args.start_row
+        next_row = last_data_row + 1 if args.start_at_end else args.start_row
         save_next_row(state_path, identity, next_row)
+    elif next_row > last_data_row + 1:
+        # Earlier versions used worksheet.max_row, which includes blank template rows.
+        next_row = max(args.start_row, last_data_row + 1)
+        save_next_row(state_path, identity, next_row)
+        print(
+            f"corrected stale checkpoint; continuing from_excel_row={next_row}",
+            file=sys.stderr,
+        )
 
     print(
         f"following workbook={excel_path} from_excel_row={next_row}; "
@@ -412,8 +425,8 @@ def main() -> int:
         file=sys.stderr,
     )
     while True:
-        current_last_row = workbook_last_row(excel_path, args.sheet)
-        if current_last_row >= next_row:
+        current_last_data_row = workbook_last_nonempty_row(excel_path, args.sheet)
+        if current_last_data_row >= next_row:
             sheet, _, _, _ = publish_pass(
                 args,
                 oci,
@@ -422,8 +435,7 @@ def main() -> int:
                 next_row,
                 lambda row: save_next_row(state_path, identity, row),
             )
-            # Mark the scan complete, including intentionally blank template rows.
-            next_row = current_last_row + 1
+            next_row = current_last_data_row + 1
             save_next_row(state_path, state_identity(excel_path, sheet, key_columns), next_row)
         time.sleep(args.poll_seconds)
 
