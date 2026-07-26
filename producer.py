@@ -9,6 +9,7 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -61,6 +62,33 @@ def parse_args() -> argparse.Namespace:
         help="First Excel data row to publish, including the header offset (default: 2)",
     )
     parser.add_argument("--max-rows", type=int, help="Publish at most this many rows")
+    parser.add_argument(
+        "--follow",
+        action="store_true",
+        help="Continuously poll the workbook and publish newly appended non-empty rows",
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=2.0,
+        help="Workbook polling interval when --follow is used (default: 2)",
+    )
+    parser.add_argument(
+        "--state-file",
+        type=Path,
+        default=Path("oci-streams-producer-state.json"),
+        help="Checkpoint file for --follow (default: ./oci-streams-producer-state.json)",
+    )
+    parser.add_argument(
+        "--reset-state",
+        action="store_true",
+        help="Ignore any existing --state-file and publish from --start-row",
+    )
+    parser.add_argument(
+        "--start-at-end",
+        action="store_true",
+        help="With --follow, ignore existing rows and publish only rows appended after startup",
+    )
     parser.add_argument(
         "--enable-retries",
         action="store_true",
@@ -155,6 +183,64 @@ def iter_messages(
     return worksheet.title, len(headers), generate()
 
 
+def workbook_last_row(excel_path: Path, sheet_name: str | None) -> int:
+    """Return the current physical extent; follow mode supports append-only sheets."""
+    workbook = load_workbook(excel_path, read_only=True, data_only=True)
+    try:
+        worksheet = workbook[sheet_name] if sheet_name else workbook.active
+        return max(1, worksheet.max_row or 1)
+    finally:
+        workbook.close()
+
+
+def workbook_sheet_name(excel_path: Path, sheet_name: str | None) -> str:
+    workbook = load_workbook(excel_path, read_only=True, data_only=True)
+    try:
+        worksheet = workbook[sheet_name] if sheet_name else workbook.active
+        return worksheet.title
+    finally:
+        workbook.close()
+
+
+def state_identity(excel_path: Path, sheet: str, key_columns: Sequence[str]) -> dict[str, Any]:
+    return {
+        "excel": str(excel_path),
+        "sheet": sheet,
+        "key_columns": list(key_columns),
+    }
+
+
+def load_next_row(state_path: Path, identity: dict[str, Any]) -> int | None:
+    if not state_path.is_file():
+        return None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid state file: {state_path}") from exc
+    if state.get("identity") != identity:
+        raise ValueError(
+            f"State file {state_path} belongs to a different workbook, sheet, or key. "
+            "Use --reset-state or choose a new --state-file."
+        )
+    next_row = state.get("next_excel_row")
+    if not isinstance(next_row, int) or next_row < 2:
+        raise ValueError(f"Invalid next_excel_row in state file: {state_path}")
+    return next_row
+
+
+def save_next_row(state_path: Path, identity: dict[str, Any], next_row: int) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "identity": identity,
+        "next_excel_row": next_row,
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    temporary = state_path.with_suffix(state_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(state_path)
+
+
 def iter_batches(
     messages: Iterator[tuple[int, bytes, bytes]],
     max_bytes: int,
@@ -238,12 +324,57 @@ def send_batch(oci: Any, client: Any, stream_ocid: str, batch, enable_retries: b
         raise RuntimeError("OCI rejected messages: " + "; ".join(failures))
 
 
+def publish_pass(
+    args: argparse.Namespace,
+    oci: Any,
+    client: Any,
+    key_columns: Sequence[str],
+    start_row: int,
+    on_batch_success=None,
+) -> tuple[str, int, int, int]:
+    """Publish one scan of appended rows and return sheet, columns, rows, bytes."""
+    sheet, column_count, messages = iter_messages(
+        args.excel.resolve(), args.sheet, key_columns, start_row, args.max_rows
+    )
+    total_rows = 0
+    total_bytes = 0
+    total_batches = 0
+    for batch in iter_batches(messages, args.batch_max_bytes, args.batch_max_messages):
+        decoded_bytes = sum(len(key) + len(value) for _, key, value in batch)
+        total_batches += 1
+        total_rows += len(batch)
+        total_bytes += decoded_bytes
+        print(
+            f"batch={total_batches} rows={len(batch)} decoded_bytes={decoded_bytes}",
+            file=sys.stderr,
+        )
+        if not args.dry_run:
+            send_batch(oci, client, args.stream_ocid, batch, args.enable_retries)
+            if on_batch_success:
+                on_batch_success(batch[-1][0] + 1)
+    action = "validated" if args.dry_run else "published"
+    print(
+        f"{action}: file={args.excel.name} sheet={sheet!r} columns={column_count} "
+        f"rows={total_rows} batches={total_batches} decoded_bytes={total_bytes}",
+        file=sys.stderr,
+    )
+    return sheet, column_count, total_rows, total_bytes
+
+
 def main() -> int:
     args = parse_args()
     if args.start_row < 2:
         raise ValueError("--start-row must be 2 or greater")
     if args.max_rows is not None and args.max_rows < 1:
         raise ValueError("--max-rows must be at least 1")
+    if args.poll_seconds <= 0:
+        raise ValueError("--poll-seconds must be positive")
+    if args.start_at_end and not args.follow:
+        raise ValueError("--start-at-end requires --follow")
+    if args.follow and args.max_rows is not None:
+        raise ValueError("--max-rows cannot be combined with --follow")
+    if args.dry_run and args.follow:
+        raise ValueError("--dry-run cannot be combined with --follow")
     if not args.excel.is_file():
         raise FileNotFoundError(args.excel)
     if not args.dry_run and (not args.stream_ocid or not args.endpoint):
@@ -256,45 +387,45 @@ def main() -> int:
     if not key_columns:
         raise ValueError("--key-columns must contain at least one column")
 
-    sheet, column_count, messages = iter_messages(
-        args.excel.resolve(),
-        args.sheet,
-        key_columns,
-        args.start_row,
-        args.max_rows,
-    )
-    batches = iter_batches(
-        messages, args.batch_max_bytes, args.batch_max_messages
-    )
-
     oci = client = None
     if not args.dry_run:
         oci, client = create_stream_client(args)
 
-    total_rows = 0
-    total_bytes = 0
-    total_batches = 0
-    for batch in batches:
-        decoded_bytes = sum(len(key) + len(value) for _, key, value in batch)
-        total_batches += 1
-        total_rows += len(batch)
-        total_bytes += decoded_bytes
-        print(
-            f"batch={total_batches} rows={len(batch)} decoded_bytes={decoded_bytes}",
-            file=sys.stderr,
-        )
-        if not args.dry_run:
-            send_batch(
-                oci, client, args.stream_ocid, batch, args.enable_retries
-            )
+    if not args.follow:
+        publish_pass(args, oci, client, key_columns, args.start_row)
+        return 0
 
-    action = "validated" if args.dry_run else "published"
+    # Follow mode is append-only: it checkpoints a physical Excel row after each
+    # successful PUT batch, then reopens the workbook on the next poll.
+    excel_path = args.excel.resolve()
+    state_path = args.state_file.resolve()
+    initial_sheet = workbook_sheet_name(excel_path, args.sheet)
+    identity = state_identity(excel_path, initial_sheet, key_columns)
+    next_row = None if args.reset_state else load_next_row(state_path, identity)
+    if next_row is None:
+        next_row = workbook_last_row(excel_path, args.sheet) + 1 if args.start_at_end else args.start_row
+        save_next_row(state_path, identity, next_row)
+
     print(
-        f"{action}: file={args.excel.name} sheet={sheet!r} columns={column_count} "
-        f"rows={total_rows} batches={total_batches} decoded_bytes={total_bytes}",
+        f"following workbook={excel_path} from_excel_row={next_row}; "
+        f"state_file={state_path}",
         file=sys.stderr,
     )
-    return 0
+    while True:
+        current_last_row = workbook_last_row(excel_path, args.sheet)
+        if current_last_row >= next_row:
+            sheet, _, _, _ = publish_pass(
+                args,
+                oci,
+                client,
+                key_columns,
+                next_row,
+                lambda row: save_next_row(state_path, identity, row),
+            )
+            # Mark the scan complete, including intentionally blank template rows.
+            next_row = current_last_row + 1
+            save_next_row(state_path, state_identity(excel_path, sheet, key_columns), next_row)
+        time.sleep(args.poll_seconds)
 
 
 if __name__ == "__main__":

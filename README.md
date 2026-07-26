@@ -2,8 +2,8 @@
 
 本示例参考 Oracle 官方 [SDK for Python Streaming Quickstart](https://docs.oracle.com/en-us/iaas/Content/Streaming/Tasks/streaming-quickstart-oci-sdk-for-python.htm)，将生产者和消费者拆分为两个独立程序：
 
-- `producer.py`：读取 Excel；每一行转为一条 UTF-8 JSON 消息；Base64 编码后批量发送。
-- `consumer.py`：通过 consumer group cursor 拉取消息；Base64 解码并输出 JSON Lines。
+- `producer.py`：读取 Excel；每一行转为一条 UTF-8 JSON 消息；Base64 编码后批量发送。加 `--follow` 后持续发送新追加的行。
+- `consumer.py`：通过 consumer group cursor 拉取消息；Base64 解码并输出 JSON Lines。加 `--follow` 后持续消费。
 
 ## 本工作簿的消息设计
 
@@ -95,7 +95,35 @@ python consumer.py \
 
 注意：已有 consumer group 会从它已提交的 offset 继续消费；`--cursor-type` 只在该 group 第一次建立时生效。每个并行消费者必须使用不同的 `--instance`。
 
-## 4. 启动生产者
+## 4. 持续写入与持续消费
+
+先启动持续消费者：
+
+```bash
+python consumer.py \
+  --group nvlink-metrics-group \
+  --instance consumer-1 \
+  --output consumed_messages.jsonl \
+  --follow \
+  --poll-seconds 1
+```
+
+再启动持续生产者：
+
+```bash
+python producer.py \
+  '/Users/winson/Desktop/NMX-T/NVLink Metrics Example Data/nvlink-switch-metrics-test.xlsx' \
+  --sheet nvlink-switch-metrics \
+  --follow \
+  --poll-seconds 2 \
+  --state-file ./nvlink-producer-state.json
+```
+
+生产者每隔 `--poll-seconds` 秒重新打开 Excel，仅发送 checkpoint 之后**新增的非空行**。成功发送每个批次后，状态写入 `--state-file`；重启时会从该位置继续，避免重复发送。
+
+此模式假设 Excel 是**追加行（append-only）**的：请在已有数据的末尾新增行，不要修改已发送行或回填以前的空行。若要重新发送全部数据，删除状态文件或加 `--reset-state`。若只关注进程启动后新增的数据，加 `--start-at-end`。
+
+## 5. 一次性历史回放
 
 建议先发送 5 行做端到端测试：
 
@@ -131,5 +159,6 @@ python consumer.py \
 - `put_messages` 可能部分成功；生产者会逐条检查返回结果，遇到失败立即以非零状态退出并报告 Excel 行号。
 - 生产者默认不对 PUT 自动重试，因为“服务端已接收但客户端超时”的重试可能产生重复消息。需要重试时显式加 `--enable-retries`，消费者应按业务键去重。
 - 消费者默认手动提交 offset，提供至少一次处理语义。若进程在“写出成功、提交失败”之间中断，重启后可能再次输出同一消息。
+- `producer.py --follow` 通过轮询 Excel 实现实时性；Excel 文件应先保存完成，再由下一轮轮询读取。正在写入中的文件可能暂时无法打开，建议用原子保存/重命名方式更新文件。
 - OCI Streams 每个分区的写入上限为 1 MB/s；大量发送时应按 Stream 分区数和 key 分布评估吞吐。
 - 消息 retention 到期后会被删除；Stream 的 retention 创建后不能修改。
