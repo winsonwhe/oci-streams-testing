@@ -65,7 +65,6 @@ export OCI_CONFIG_PROFILE='DEFAULT'
 
 ```bash
 python producer.py \
-  './nvlink-switch-metrics-test.xlsx' \
   --sheet nvlink-switch-metrics \
   --dry-run
 ```
@@ -74,7 +73,6 @@ python producer.py \
 
 ```bash
 python producer.py \
-  './nvlink-switch-metrics-test.xlsx' \
   --max-rows 5 \
   --dry-run
 ```
@@ -129,7 +127,6 @@ python producer.py \
 
 ```bash
 python producer.py \
-  './nvlink-switch-metrics-test.xlsx' \
   --sheet nvlink-switch-metrics \
   --max-rows 5
 ```
@@ -138,7 +135,6 @@ python producer.py \
 
 ```bash
 python producer.py \
-  './nvlink-switch-metrics-test.xlsx' \
   --sheet nvlink-switch-metrics
 ```
 
