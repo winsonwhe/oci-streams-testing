@@ -52,7 +52,7 @@ pip install -r requirements.txt
 推荐通过环境变量提供，不要把 OCID 或凭证写入代码：
 
 ```bash
-export OCI_STREAM_OCID='ocid1.stream.oc1.ap-sydney-1.amaaaaaaprp6l3qajlpdrttwqxdp6qaw7vyraasilnm3l66tfwofhinf3knq'
+export OCI_STREAM_OCID='ocid1.stream.oc1.ap-sydney-1.xxxx'
 export OCI_MESSAGE_ENDPOINT='https://cell-1.streaming.ap-sydney-1.oci.oraclecloud.com'
 export OCI_CONFIG_PROFILE='DEFAULT'
 ```
